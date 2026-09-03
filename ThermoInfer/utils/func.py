@@ -479,7 +479,7 @@ class tGEM(object):
         return (min_v, max_v)
     
     
-    def concurrent_infer_v(self, v_si, v_ei, thread=16, batch_size=200):
+    def concurrent_infer_v(self, v_si, v_ei, process=16, batch_size=200):
         # 
         v_ei = len(self.GEM.reactions) - 1 if v_ei is None else v_ei
         v_ei = min(v_ei, len(self.GEM.reactions) - 1)
@@ -490,9 +490,10 @@ class tGEM(object):
             pd.DataFrame(columns=['rxn num', 'lv', 'uv']).to_csv(self.FBA_res_file_path, index=False)
         
         infer_v = self.infer_v
-        p = Pool(thread)
+        p = Pool(process)
         v_range = []
         Recon3D_Directionality_FBA = pd.read_csv(self.FBA_res_file_path, index_col=0)
+        failed = []
         batch_num = 0
         for i in range(v_si, v_ei+1):
             rxn = self.GEM.reactions[i]
@@ -506,8 +507,9 @@ class tGEM(object):
                 p.join()
                 
                 # get the result
-                new_df = pd.DataFrame(data=[(i, *r.get()) for (i, r) in v_range if r.successful()], 
+                new_df = pd.DataFrame(data=[(i, *r.get()) for (i, r) in v_range if r.successful()],
                                 columns=['rxn num', 'lv', 'uv']).set_index('rxn num')
+                failed.extend([i for (i, r) in v_range if not r.successful()])
 
                 # update and save the data
                 Recon3D_Directionality_FBA = pd.concat([pd.read_csv(self.FBA_res_file_path, index_col=0), new_df], axis=0).sort_index()
@@ -515,10 +517,33 @@ class tGEM(object):
                 print(f'{batch_num} batch done')
             
                 if i < v_ei:
-                    p = Pool(thread)
+                    p = Pool(process)
                     v_range = []
                     batch_num += 1
                 
+        # retry the failed reactions, up to 3 times
+        for retry_num in range(1, 4):
+            if not failed:
+                break
+            print(f'Retrying {len(failed)} failed reaction(s), attempt {retry_num} ...')
+            p = Pool(min(process, len(failed)))
+            retry_res = [(i, p.apply_async(func=infer_v, args=(i,))) for i in failed]
+            p.close()
+            p.join()
+
+            new_df = pd.DataFrame(data=[(i, *r.get()) for (i, r) in retry_res if r.successful()],
+                            columns=['rxn num', 'lv', 'uv']).set_index('rxn num')
+            failed = [i for (i, r) in retry_res if not r.successful()]
+
+            # update and save the data
+            Recon3D_Directionality_FBA = pd.concat([pd.read_csv(self.FBA_res_file_path, index_col=0), new_df], axis=0).sort_index()
+            Recon3D_Directionality_FBA.to_csv(self.FBA_res_file_path)
+
+        if failed:
+            failed_path = self.FBA_res_file_path.replace('.csv', '_failed.csv')
+            print(f'WARNING: {len(failed)} reaction(s) still failed after 3 retries, saved to {failed_path}')
+            pd.DataFrame({'rxn num': failed}).set_index('rxn num').to_csv(failed_path)
+
         print('All done')
         return None
 
@@ -547,7 +572,7 @@ class tGEM(object):
         t1 = time.perf_counter()
         return r
 
-    def concurrent_infer_v_and_dGr(self, v_si=0, v_ei=None, thread=16, batch_size=200, v_list=None):
+    def concurrent_infer_v_and_dGr(self, v_si=0, v_ei=None, process=16, batch_size=200, v_list=None):
         #
         v_ei = len(self.GEM.reactions) - 1 if v_ei is None else v_ei
         v_ei = min(v_ei, len(self.GEM.reactions) - 1)
@@ -566,8 +591,9 @@ class tGEM(object):
         completed_df = pd.read_csv(self.TFBA_res_file_path, index_col=0)
         completed_rxns = set(completed_df.index)
 
-        p = Pool(thread)
+        p = Pool(process)
         v_range = []
+        failed = []
         total = len([i for i in v_list if (not self.GEM.reactions[i].boundary) and (i not in completed_rxns)])
         pbar = tqdm(total=total, desc='Running TFBA inference')
         batch_num = 0
@@ -584,6 +610,7 @@ class tGEM(object):
                 # get the result
                 new_df = pd.DataFrame(data=[(i, *r.get()) for (i, r) in v_range if r.successful()],
                                 columns=['rxn num', 'lv', 'uv', 'ldGr', 'udGr']).set_index('rxn num')
+                failed.extend([i for (i, r) in v_range if not r.successful()])
 
                 # update and save the data
                 if not new_df.empty:
@@ -598,14 +625,45 @@ class tGEM(object):
                     Recon3D_Directionality_TFBA.to_csv(self.TFBA_res_file_path)
 
                 if i < v_ei:
-                    p = Pool(thread)
+                    p = Pool(process)
                     v_range = []
+
+        # retry the failed reactions, up to 3 times
+        for retry_num in range(1, 4):
+            if not failed:
+                break
+            print(f'Retrying {len(failed)} failed reaction(s), attempt {retry_num} ...')
+            p = Pool(min(process, len(failed)))
+            retry_res = [(i, p.apply_async(func=infer_v_and_dGr, args=(i,))) for i in failed]
+            p.close()
+            p.join()
+
+            new_df = pd.DataFrame(data=[(i, *r.get()) for (i, r) in retry_res if r.successful()],
+                            columns=['rxn num', 'lv', 'uv', 'ldGr', 'udGr']).set_index('rxn num')
+            failed = [i for (i, r) in retry_res if not r.successful()]
+
+            # update and save the data
+            if not new_df.empty:
+                old_df = pd.read_csv(self.TFBA_res_file_path, index_col=0)
+                if old_df.empty:
+                    Recon3D_Directionality_TFBA = new_df
+                else:
+                    Recon3D_Directionality_TFBA = pd.concat([old_df, new_df], axis=0)
+
+                # Remove duplicates (keep last) and sort
+                Recon3D_Directionality_TFBA = Recon3D_Directionality_TFBA[~Recon3D_Directionality_TFBA.index.duplicated(keep='last')].sort_index()
+                Recon3D_Directionality_TFBA.to_csv(self.TFBA_res_file_path)
+
+        if failed:
+            failed_path = self.TFBA_res_file_path.replace('.csv', '_failed.csv')
+            print(f'WARNING: {len(failed)} reaction(s) still failed after 3 retries, saved to {failed_path}')
+            pd.DataFrame({'rxn num': failed}).set_index('rxn num').to_csv(failed_path)
 
         pbar.close()
         return None
 
     def concurrent_optimize(self, thermo_constrain, concentration_ub, biomass_synthesis,
-                            thread=16, batch_size=200, obj_list=None):
+                            process=16, batch_size=200, obj_list=None):
         # 
         def build_model(obj):
             with gp.Env() as env:
@@ -620,7 +678,7 @@ class tGEM(object):
                 output = m
             return output
                 
-        p = Pool(thread)
+        p = Pool(process)
         res_list = []
         for i, obj in enumerate(obj_list):
             print(i, self.dGr[i])
@@ -634,7 +692,7 @@ class tGEM(object):
                 print(f'{i//batch_size} batch done')
             
                 if i+1 < len(obj_list):
-                    p = Pool(thread)
+                    p = Pool(process)
                 
         print('All done')
         return res_list
