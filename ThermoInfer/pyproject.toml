@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ThermoInfer"
+version = "2.0.0"
+description = "Inference of reaction directionality using thermodynamically constrained flux balance analysis (TFBA)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+    {name = "Wenchao Fan，Jie Zhong"}
+]
+keywords = ["metabolic modeling", "thermodynamics", "flux balance analysis", "TFBA", "systems biology"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "pandas>=1.3.0",
+    "cobra>=0.26.0",
+    "rdkit>=2022.03.1",
+    "tqdm>=4.62.0",
+    "scipy>=1.7.0",
+    "matplotlib>=3.4.0",
+    "biopython>=1.79",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-username/ThermoInfer"
+Repository = "https://github.com/your-username/ThermoInfer"
+Documentation = "https://github.com/your-username/ThermoInfer"
+
+[tool.setuptools]
+package-dir = {"ThermoInfer" = "."}
+packages = ["ThermoInfer", "ThermoInfer.utils", "ThermoInfer.data", "ThermoInfer.api"]
+
+[tool.setuptools.package-data]
+"ThermoInfer.data" = ["**/*.csv", "**/*.xml", "**/*.mat", "**/*.json"]
