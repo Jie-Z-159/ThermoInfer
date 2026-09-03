@@ -42,7 +42,4 @@ Documentation = "https://github.com/your-username/ThermoInfer"
 
 [tool.setuptools]
 package-dir = {"ThermoInfer" = "."}
-packages = ["ThermoInfer", "ThermoInfer.utils", "ThermoInfer.data", "ThermoInfer.api"]
-
-[tool.setuptools.package-data]
-"ThermoInfer.data" = ["**/*.csv", "**/*.xml", "**/*.mat", "**/*.json"]
+packages = ["ThermoInfer", "ThermoInfer.utils", "ThermoInfer.api"]
