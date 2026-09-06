@@ -161,9 +161,11 @@ def infer_dGr_range(model_dict, v_num, sense='min', OutputFlag=0):
 
 
 
-def direction_for_v_range(lv, uv):
-    lv = 0 if np.isclose(lv,0) else lv
-    uv = 0 if np.isclose(uv,0) else uv
+def direction_for_v_range(lv, uv, tol=1e-6):
+    if np.isnan(lv) or np.isnan(uv):
+        return 'undetermined'
+    lv = 0 if abs(lv) <= tol else lv
+    uv = 0 if abs(uv) <= tol else uv
     if lv==0 and uv==0:
         return 'blocked'
     elif lv<0 and uv>0:
@@ -175,9 +177,13 @@ def direction_for_v_range(lv, uv):
     else:
         print(lv, uv)
         raise ValueError()
-    
 
-def direction_for_dGr_range(ldGr, udGr):
+
+def direction_for_dGr_range(ldGr, udGr, tol=1e-6):
+    if np.isnan(ldGr) or np.isnan(udGr):
+        return 'undetermined'
+    ldGr = 0 if abs(ldGr) <= tol else ldGr
+    udGr = 0 if abs(udGr) <= tol else udGr
     if ldGr<0 and udGr>0:
         return 'bidirectional'
     elif ldGr>=0 and udGr>0:
