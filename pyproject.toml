@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ThermoInfer"
-version = "2.0.0"
+version = "2.1.0"
 description = "Inference of reaction directionality using thermodynamically constrained flux balance analysis (TFBA)"
 readme = "README.md"
 requires-python = ">=3.8"

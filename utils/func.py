@@ -8,6 +8,8 @@ from functools import reduce
 import gurobipy as gp
 from gurobipy import GRB
 from time import strftime, gmtime, perf_counter
+import threading
+import multiprocessing
 from multiprocessing import Process, Pool
 import cobra
 
@@ -17,6 +19,15 @@ from ThermoInfer.utils.constants import *
 
 RT = R * default_T
 ln10 = math.log(10)
+
+# Fixed solver settings, kept in sync with the COPT implementation
+# (utils/copt_func.py):
+#   MIPGap = 1e-3, set per solve in infer_v_range / infer_dGr_range
+#   Threads = 1: parallelism is done at the process level. MIP thread
+#   scaling is inefficient, and many workers x auto threads oversubscribe
+#   the machine. Scale throughput via --processes instead.
+_REL_GAP = 1e-3
+_THREADS_PER_WORKER = 1
 
 
 def TFBA(model:cobra.core.model.Model, 
@@ -31,6 +42,7 @@ def TFBA(model:cobra.core.model.Model,
     m.setParam('MIPFocus', 0)
     m.setParam('IntFeasTol', 1e-9)
     m.setParam('FeasibilityTol', 1e-9)
+    m.setParam('Threads', _THREADS_PER_WORKER)
 
     ''' Parameters of the network '''
     lv, uv = np.array([(rxn.lower_bound, rxn.upper_bound) for rxn in model.reactions]).T
@@ -84,6 +96,13 @@ def TFBA(model:cobra.core.model.Model,
 
         m.addConstr(real_dGr[have_dGr] >= -4000 * a0[have_dGr] + 0.0001, name='therb') # when a0=0, v<=0, u_dGr>=0
         m.addConstr(real_dGr[have_dGr] <= 4000 * (1-a0)[have_dGr] - 0.0001, name='therf') # when a0=1, v>=0, l_dGr<=0
+
+        # a reaction's dGr range is bounded iff all its metabolites are anchored
+        # by at least one dG-constrained reaction (mirrors utils/copt_func.py)
+        anchored_met = np.abs(S[:, have_dGr]).sum(axis=1) > 0
+        col_nz = [np.nonzero(S[:, j])[0] for j in range(v.shape[0])]
+        anchored = np.array([len(idx) > 0 and bool(anchored_met[idx].all()) for idx in col_nz])
+        output['anchored'] = anchored
         
 
     ''' upper limit of whole metabolic concentration'''
@@ -134,25 +153,34 @@ def infer_v_range(model_dict, v_num, sense='min', OutputFlag=0):
     # main func
     model = model_dict['model']
     model.setParam('OutputFlag', OutputFlag)
-    model.setParam('MIPGap', 1e-3)
+    model.setParam('MIPGap', _REL_GAP)
     rxn_v = model_dict['v'][v_num]
-    
+
     model.setObjective(rxn_v, {'min':GRB.MINIMIZE, 'max':GRB.MAXIMIZE}[sense])
     model.optimize()
-    r = 0.0 if model.ObjVal==-0.0 else np.round(model.ObjVal, 6)
-
-    return r
+    if model.Status == GRB.OPTIMAL:
+        r = 0.0 if model.ObjVal==-0.0 else np.round(model.ObjVal, 6)
+        return r
+    if model.Status in (GRB.INF_OR_UNBD, GRB.UNBOUNDED):
+        return -np.inf if sense == 'min' else np.inf
+    return np.nan
 
 
 def infer_dGr_range(model_dict, v_num, sense='min', OutputFlag=0):
     # main func
     model = model_dict['model']
     model.setParam('OutputFlag', OutputFlag)
-    model.setParam('MIPGap', 1e-3)
+    model.setParam('MIPGap', _REL_GAP)
     dgr = model_dict['real_dGr'][v_num]
-    
+
     model.setObjective(dgr, {'min':GRB.MINIMIZE, 'max':GRB.MAXIMIZE}[sense])
     model.optimize()
+    if model.Status in (GRB.INF_OR_UNBD, GRB.UNBOUNDED):
+        return -np.inf if sense == 'min' else np.inf
+    if model.Status != GRB.OPTIMAL:
+        if not model_dict['anchored'][v_num]:
+            return -np.inf if sense == 'min' else np.inf
+        return np.nan
     r = 0.0 if model.ObjVal==-0.0 else np.round(model.ObjVal, 6)
     r = np.inf if r>=1e5 else r
     r = -np.inf if r<=-1e5 else r
@@ -441,6 +469,73 @@ def diff_atom(reaction: Reaction, ignore_H_ion=False, ignore_H2O=False):
     return unbalanced_atom if unbalanced_atom else True
 
 
+# -----------------------------------------------------------------------
+# multiprocessing worker plumbing (mirrors utils/copt_func.py): the tGEM
+# instance is passed to each worker exactly once via the pool initializer;
+# every worker then builds its model once per chunk and re-uses it for all
+# reactions in that chunk.
+# -----------------------------------------------------------------------
+
+# Explicit 'fork' context: shared multiprocessing.Value counters only work
+# through inheritance; Python >= 3.14 defaults to forkserver on Linux.
+_MP_CTX = multiprocessing.get_context('fork')
+
+_worker_tgem = None
+_worker_counter = None
+
+
+def _init_worker(tgem, counter=None):
+    global _worker_tgem, _worker_counter
+    _worker_tgem = tgem
+    _worker_counter = counter
+
+
+def _run_tfba_chunk(vi_list):
+    return vi_list, _worker_tgem.infer_v_and_dGr_batch(vi_list, progress=_worker_counter)
+
+
+def _run_fba_chunk(vi_list):
+    return vi_list, _worker_tgem.infer_v_batch(vi_list, progress=_worker_counter)
+
+
+def _chunk_size(n_todo, process, batch_size):
+    """Task granularity: keep every worker busy (>= 4 tasks per worker),
+    but never larger than batch_size. Results are saved per task."""
+    if n_todo <= 0:
+        return 1
+    return max(1, min(batch_size, math.ceil(n_todo / max(1, process * 4))))
+
+
+def _save_rows(res_path, rows, columns):
+    if not rows:
+        return
+    new_df = pd.DataFrame(data=rows, columns=columns).set_index('rxn num')
+    old_df = pd.read_csv(res_path, index_col=0)
+    df = new_df if old_df.empty else pd.concat([old_df, new_df], axis=0)
+    df = df[~df.index.duplicated(keep='last')].sort_index()
+    df.to_csv(res_path)
+
+
+def _bump(progress):
+    if progress is not None:
+        with progress.get_lock():
+            progress.value += 1
+
+
+def _progress_pump(pbar, counter, stop_event, interval=5):
+    last = 0
+    while not stop_event.wait(interval):
+        with counter.get_lock():
+            cur = counter.value
+        if cur > last:
+            pbar.update(cur - last)
+            last = cur
+    with counter.get_lock():
+        cur = counter.value
+    if cur > last:
+        pbar.update(cur - last)
+
+
 class tGEM(object):
     def __init__(self, GEM, dGr, concentration_ub=None, biomass_synthesis=None):
         self.GEM = GEM
@@ -469,24 +564,34 @@ class tGEM(object):
         return v.X
     
     def infer_v(self, vi):
-        # 
-        # mutiprocessing the main function
-        t0 = time.perf_counter()
-        with gp.Env() as env:
-            m = TFBA(self.GEM, thermo_constrain=None, concentration_ub=self.concentration_ub, 
+        ''' main func for FBA directionality (builds a one-shot model) '''
+        return self.infer_v_batch([vi])[0][1:]
+
+    def infer_v_batch(self, vi_list, progress=None):
+        ''' FBA directionality for a list of reactions, one shared LP model '''
+        results = []
+        env = gp.Env(empty=True)
+        env.setParam('OutputFlag', 0)
+        env.start()
+        try:
+            m = TFBA(self.GEM, thermo_constrain=None, concentration_ub=self.concentration_ub,
                      biomass_synthesis=self.biomass_synthesis, env=env)
             m['model'].setParam('MIPFocus', self.MIPFocus)
-            max_v = infer_v_range(m, vi, 'max')
-            min_v = infer_v_range(m, vi, 'min')
+            for vi in vi_list:
+                try:
+                    max_v = infer_v_range(m, vi, 'max')
+                    min_v = infer_v_range(m, vi, 'min')
+                    results.append((vi, min_v, max_v))
+                except Exception as e:
+                    print(f'rxn {vi} FBA failed: {e}', flush=True)
+                finally:
+                    _bump(progress)
+        finally:
+            env.dispose()
 
-        t1 = time.perf_counter()
-        t = strftime("%M:%S", gmtime(t1-t0))
-        print(vi, f'v: {(min_v, max_v)}', t)
-        return (min_v, max_v)
-    
-    
-    def concurrent_infer_v(self, v_si, v_ei, process=16, batch_size=200):
-        # 
+        return results
+
+    def concurrent_infer_v(self, v_si, v_ei=None, process=16, chunk_size=200):
         v_ei = len(self.GEM.reactions) - 1 if v_ei is None else v_ei
         v_ei = min(v_ei, len(self.GEM.reactions) - 1)
         if self.FBA_res_file_path is None:
@@ -494,57 +599,34 @@ class tGEM(object):
             return None
         elif not os.path.isfile(self.FBA_res_file_path):
             pd.DataFrame(columns=['rxn num', 'lv', 'uv']).to_csv(self.FBA_res_file_path, index=False)
-        
-        infer_v = self.infer_v
-        p = Pool(process)
-        v_range = []
-        Recon3D_Directionality_FBA = pd.read_csv(self.FBA_res_file_path, index_col=0)
+
+        completed = set(pd.read_csv(self.FBA_res_file_path, index_col=0).index)
+        todo = [i for i in range(v_si, v_ei + 1)
+                if (not self.GEM.reactions[i].boundary) and (i not in completed)]
+        if not todo:
+            print('All done')
+            return None
+
+        chunk = _chunk_size(len(todo), process, chunk_size)
+        chunks = [todo[k:k + chunk] for k in range(0, len(todo), chunk)]
+        counter = _MP_CTX.Value('i', 0)
         failed = []
-        batch_num = 0
-        for i in range(v_si, v_ei+1):
-            rxn = self.GEM.reactions[i]
-            if (not rxn.boundary) and (i not in Recon3D_Directionality_FBA.index):
-                print(i, self.dGr[i])
-                r = p.apply_async(func=infer_v, args=(i,))
-                v_range.append([i, r])
+        with _MP_CTX.Pool(process, initializer=_init_worker, initargs=(self, counter)) as pool:
+            pbar = tqdm(total=len(todo), desc='Gurobi-FBA inference')
+            stop_event = threading.Event()
+            pump = threading.Thread(target=_progress_pump, args=(pbar, counter, stop_event), daemon=True)
+            pump.start()
+            try:
+                for vi_list, res in pool.imap_unordered(_run_fba_chunk, chunks):
+                    done_ids = {r[0] for r in res}
+                    failed.extend(vi for vi in vi_list if vi not in done_ids)
+                    _save_rows(self.FBA_res_file_path, res, ['rxn num', 'lv', 'uv'])
+            finally:
+                stop_event.set()
+                pump.join()
+                pbar.close()
 
-            if (len(v_range) == batch_size) or (i == v_ei):
-                p.close()
-                p.join()
-                
-                # get the result
-                new_df = pd.DataFrame(data=[(i, *r.get()) for (i, r) in v_range if r.successful()],
-                                columns=['rxn num', 'lv', 'uv']).set_index('rxn num')
-                failed.extend([i for (i, r) in v_range if not r.successful()])
-
-                # update and save the data
-                Recon3D_Directionality_FBA = pd.concat([pd.read_csv(self.FBA_res_file_path, index_col=0), new_df], axis=0).sort_index()
-                Recon3D_Directionality_FBA.to_csv(self.FBA_res_file_path)
-                print(f'{batch_num} batch done')
-            
-                if i < v_ei:
-                    p = Pool(process)
-                    v_range = []
-                    batch_num += 1
-                
-        # retry the failed reactions, up to 3 times
-        for retry_num in range(1, 4):
-            if not failed:
-                break
-            print(f'Retrying {len(failed)} failed reaction(s), attempt {retry_num} ...')
-            p = Pool(min(process, len(failed)))
-            retry_res = [(i, p.apply_async(func=infer_v, args=(i,))) for i in failed]
-            p.close()
-            p.join()
-
-            new_df = pd.DataFrame(data=[(i, *r.get()) for (i, r) in retry_res if r.successful()],
-                            columns=['rxn num', 'lv', 'uv']).set_index('rxn num')
-            failed = [i for (i, r) in retry_res if not r.successful()]
-
-            # update and save the data
-            Recon3D_Directionality_FBA = pd.concat([pd.read_csv(self.FBA_res_file_path, index_col=0), new_df], axis=0).sort_index()
-            Recon3D_Directionality_FBA.to_csv(self.FBA_res_file_path)
-
+        failed = self._retry(_run_fba_chunk, failed, process)
         if failed:
             failed_path = self.FBA_res_file_path.replace('.csv', '_failed.csv')
             print(f'WARNING: {len(failed)} reaction(s) still failed after 3 retries, saved to {failed_path}')
@@ -554,119 +636,109 @@ class tGEM(object):
         return None
 
     def infer_v_and_dGr(self, vi):
-        ''' mutiprocessing the main fun '''
-        t0 = time.perf_counter()
-        # Create a silent Gurobi environment
-        env = gp.Env(empty=True)
-        env.setParam("OutputFlag", 0)
-        env.start()
+        ''' main func for TFBA directionality (builds a one-shot model) '''
+        return self.infer_v_and_dGr_batch([vi])[0][1:]
 
+    def infer_v_and_dGr_batch(self, vi_list, progress=None):
+        ''' TFBA directionality for a list of reactions, one shared MIP model.
+
+        The legacy per-reaction +-1e6 bounds on real_std_dGr are dropped:
+        unbounded dGr objectives are detected via the UNBOUNDED solver status
+        instead (numerically equivalent, mirrors utils/copt_func.py), so that
+        the model can be re-used across a whole chunk. '''
+        results = []
+        env = gp.Env(empty=True)
+        env.setParam('OutputFlag', 0)
+        env.start()
         try:
             m = TFBA(self.GEM, thermo_constrain=self.dGr, concentration_ub=self.concentration_ub,
                      biomass_synthesis=self.biomass_synthesis, env=env)
             m['model'].setParam('MIPFocus', self.MIPFocus)
-            m['model'].addConstr(m['real_std_dGr'][vi] >= -1e6)
-            m['model'].addConstr(m['real_std_dGr'][vi] <= 1e6)
-            max_v = infer_v_range(m, vi, 'max')
-            min_dGr = infer_dGr_range(m, vi, 'min')
-            min_v = infer_v_range(m, vi, 'min')
-            max_dGr = infer_dGr_range(m, vi, 'max')
-            r = (min_v, max_v, min_dGr, max_dGr)
+            for vi in vi_list:
+                try:
+                    max_v = infer_v_range(m, vi, 'max')
+                    min_dGr = infer_dGr_range(m, vi, 'min')
+                    min_v = infer_v_range(m, vi, 'min')
+                    max_dGr = infer_dGr_range(m, vi, 'max')
+                    results.append((vi, min_v, max_v, min_dGr, max_dGr))
+                except Exception as e:
+                    print(f'rxn {vi} TFBA failed: {e}', flush=True)
+                finally:
+                    _bump(progress)
         finally:
             env.dispose()
 
-        t1 = time.perf_counter()
-        return r
+        return results
 
-    def concurrent_infer_v_and_dGr(self, v_si=0, v_ei=None, process=16, batch_size=200, v_list=None):
-        #
+    def concurrent_infer_v_and_dGr(self, v_si=0, v_ei=None, process=16, chunk_size=200,
+                                   v_list=None):
         v_ei = len(self.GEM.reactions) - 1 if v_ei is None else v_ei
         v_ei = min(v_ei, len(self.GEM.reactions) - 1)
         if v_list is None:
-            v_list = range(v_si, v_ei+1)
+            v_list = range(v_si, v_ei + 1)
 
         if self.TFBA_res_file_path is None:
             print('Please specify the file path of TFBA result')
             return None
         elif not os.path.isfile(self.TFBA_res_file_path):
-            pd.DataFrame(columns=['rxn num', 'lv', 'uv', 'ldGr', 'udGr']).to_csv(self.TFBA_res_file_path, index=False)
+            pd.DataFrame(columns=['rxn num', 'lv', 'uv', 'ldGr', 'udGr']).to_csv(
+                self.TFBA_res_file_path, index=False)
 
-        infer_v_and_dGr = self.infer_v_and_dGr
+        completed = set(pd.read_csv(self.TFBA_res_file_path, index_col=0).index)
+        todo = [i for i in v_list
+                if (not self.GEM.reactions[i].boundary) and (i not in completed)]
+        if not todo:
+            print('All done')
+            return None
 
-        # Read completed reactions once at the beginning
-        completed_df = pd.read_csv(self.TFBA_res_file_path, index_col=0)
-        completed_rxns = set(completed_df.index)
-
-        p = Pool(process)
-        v_range = []
+        chunk = _chunk_size(len(todo), process, chunk_size)
+        chunks = [todo[k:k + chunk] for k in range(0, len(todo), chunk)]
+        counter = _MP_CTX.Value('i', 0)
         failed = []
-        total = len([i for i in v_list if (not self.GEM.reactions[i].boundary) and (i not in completed_rxns)])
-        pbar = tqdm(total=total, desc='Running TFBA inference')
-        batch_num = 0
-        for i in v_list:
-            rxn = self.GEM.reactions[i]
-            if (not rxn.boundary) and (i not in completed_rxns):
-                r = p.apply_async(func=infer_v_and_dGr, args=(i,), callback=lambda _: pbar.update(1))
-                v_range.append([i, r])
+        with _MP_CTX.Pool(process, initializer=_init_worker, initargs=(self, counter)) as pool:
+            pbar = tqdm(total=len(todo), desc='Gurobi-TFBA inference')
+            stop_event = threading.Event()
+            pump = threading.Thread(target=_progress_pump, args=(pbar, counter, stop_event), daemon=True)
+            pump.start()
+            try:
+                for vi_list, res in pool.imap_unordered(_run_tfba_chunk, chunks):
+                    done_ids = {r[0] for r in res}
+                    failed.extend(vi for vi in vi_list if vi not in done_ids)
+                    _save_rows(self.TFBA_res_file_path, res, ['rxn num', 'lv', 'uv', 'ldGr', 'udGr'])
+            finally:
+                stop_event.set()
+                pump.join()
+                pbar.close()
 
-            if (len(v_range) == batch_size) or (i == v_list[-1]):
-                p.close()
-                p.join()
-
-                # get the result
-                new_df = pd.DataFrame(data=[(i, *r.get()) for (i, r) in v_range if r.successful()],
-                                columns=['rxn num', 'lv', 'uv', 'ldGr', 'udGr']).set_index('rxn num')
-                failed.extend([i for (i, r) in v_range if not r.successful()])
-
-                # update and save the data
-                if not new_df.empty:
-                    old_df = pd.read_csv(self.TFBA_res_file_path, index_col=0)
-                    if old_df.empty:
-                        Recon3D_Directionality_TFBA = new_df
-                    else:
-                        Recon3D_Directionality_TFBA = pd.concat([old_df, new_df], axis=0)
-
-                    # Remove duplicates (keep last) and sort
-                    Recon3D_Directionality_TFBA = Recon3D_Directionality_TFBA[~Recon3D_Directionality_TFBA.index.duplicated(keep='last')].sort_index()
-                    Recon3D_Directionality_TFBA.to_csv(self.TFBA_res_file_path)
-
-                if i < v_ei:
-                    p = Pool(process)
-                    v_range = []
-
-        # retry the failed reactions, up to 3 times
-        for retry_num in range(1, 4):
-            if not failed:
-                break
-            print(f'Retrying {len(failed)} failed reaction(s), attempt {retry_num} ...')
-            p = Pool(min(process, len(failed)))
-            retry_res = [(i, p.apply_async(func=infer_v_and_dGr, args=(i,))) for i in failed]
-            p.close()
-            p.join()
-
-            new_df = pd.DataFrame(data=[(i, *r.get()) for (i, r) in retry_res if r.successful()],
-                            columns=['rxn num', 'lv', 'uv', 'ldGr', 'udGr']).set_index('rxn num')
-            failed = [i for (i, r) in retry_res if not r.successful()]
-
-            # update and save the data
-            if not new_df.empty:
-                old_df = pd.read_csv(self.TFBA_res_file_path, index_col=0)
-                if old_df.empty:
-                    Recon3D_Directionality_TFBA = new_df
-                else:
-                    Recon3D_Directionality_TFBA = pd.concat([old_df, new_df], axis=0)
-
-                # Remove duplicates (keep last) and sort
-                Recon3D_Directionality_TFBA = Recon3D_Directionality_TFBA[~Recon3D_Directionality_TFBA.index.duplicated(keep='last')].sort_index()
-                Recon3D_Directionality_TFBA.to_csv(self.TFBA_res_file_path)
-
+        failed = self._retry(_run_tfba_chunk, failed, process)
         if failed:
             failed_path = self.TFBA_res_file_path.replace('.csv', '_failed.csv')
             print(f'WARNING: {len(failed)} reaction(s) still failed after 3 retries, saved to {failed_path}')
             pd.DataFrame({'rxn num': failed}).set_index('rxn num').to_csv(failed_path)
 
-        pbar.close()
+        print('All done')
         return None
+
+    def _retry(self, chunk_fn, failed, process, max_retry=3):
+        ''' retry failed reactions with tiny chunks (4 per chunk) '''
+        for retry_num in range(1, max_retry + 1):
+            if not failed:
+                break
+            print(f'Retrying {len(failed)} failed reaction(s), attempt {retry_num} ...')
+            chunks = [failed[k:k + 4] for k in range(0, len(failed), 4)]
+            still_failed = []
+            with _MP_CTX.Pool(min(process, len(chunks)), initializer=_init_worker,
+                              initargs=(self,)) as pool:
+                for vi_list, res in pool.imap_unordered(chunk_fn, chunks):
+                    done_ids = {r[0] for r in res}
+                    still_failed.extend(vi for vi in vi_list if vi not in done_ids)
+                    res_path = self.TFBA_res_file_path if 'tfba' in chunk_fn.__name__ \
+                        else self.FBA_res_file_path
+                    columns = ['rxn num', 'lv', 'uv', 'ldGr', 'udGr'] \
+                        if chunk_fn.__name__ == '_run_tfba_chunk' else ['rxn num', 'lv', 'uv']
+                    _save_rows(res_path, res, columns)
+            failed = still_failed
+        return failed
 
     def concurrent_optimize(self, thermo_constrain, concentration_ub, biomass_synthesis,
                             process=16, batch_size=200, obj_list=None):

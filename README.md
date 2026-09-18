@@ -31,7 +31,7 @@ Integrating reaction thermodynamics is essential for refining constraint-based m
 
 ### System Requirements
 
-Users should run this protocol in a Linux or WSL2/Ubuntu environment with **Conda** installed. A valid **Gurobi license** are required. GPU acceleration is optional.
+Users should run this protocol in a Linux or WSL2/Ubuntu environment with **Conda** installed. A valid **Gurobi license** is required (a **COPT** license may be used instead as the alternative solver, see below). GPU acceleration is optional.
 
 ---
 
@@ -97,6 +97,14 @@ conda install -c gurobi gurobi -y
 
 > **CRITICAL:** Prepare a valid Gurobi license before running ThermoInfer. Academic users can obtain a free license from the [Gurobi User Portal](https://www.gurobi.com/academia/academic-program-and-licenses/).
 
+> **Note (alternative solver):** If Gurobi is not available, ThermoInfer also supports the [COPT](https://www.shanshu.ai/copt) (Cardinal Optimizer) as an alternative MILP solver. COPT likewise requires a license; free academic licenses are available from the COPT official website. To use COPT, install its Python package separately (it is not a hard dependency of ThermoInfer):
+>
+> ```bash
+> pip install coptpy
+> ```
+>
+> Then run the protocol with `--solver copt` (see Stage 3 below).
+
 ---
 
 ## Usage
@@ -124,7 +132,7 @@ Continue in the notebook to:
 python run_tfba.py yeast-GEM.xml Yeast9_standard_dGr_dGbyG.csv --compartments Yeast9_compartment_conditions.json
 ```
 
- `run_tfba.py` takes two required positional arguments: `gem_path`, the path to the GEM file, and `dgr_path`, the path to the dGbyG reaction-level prediction table. Optional arguments include `--compartments`, `--output`, `--batch-size`, `--threads`, `--biomass-fraction`, `--v-si`, `--v-ei`, and `--run-fba`.
+ `run_tfba.py` takes two required positional arguments: `gem_path`, the path to the GEM file, and `dgr_path`, the path to the dGbyG reaction-level prediction table. Optional arguments include `--solver`, `--compartments`, `--output`, `--chunk-size`, `--processes`, `--biomass-fraction`, `--v-si`, `--v-ei`, and `--run-fba`.
 
  To view all available command-line arguments and their default values, run:
 
@@ -134,7 +142,15 @@ python run_tfba.py --help
 
  This command generates `yeast-GEM_Directionality_TFBA.csv`, which contains feasible flux ranges and reaction Gibbs energy ranges inferred by ThermoInfer-based TFBA.
 
-> ** CRITICAL:** For routine execution, start with the default conservative settings, `--batch-size 20` and `--threads 5`. Increase these values only after confirming that CPU cores, memory, and Gurobi license capacity are sufficient.
+ To run the same workflow with the COPT solver instead of Gurobi:
+
+```bash
+python run_tfba.py yeast-GEM.xml Yeast9_standard_dGr_dGbyG.csv --compartments Yeast9_compartment_conditions.json --solver copt
+```
+
+ This generates `yeast-GEM_Directionality_TFBA_COPT.csv`. Both solvers use identical model formulations and numerical settings.
+
+> ** CRITICAL:** For routine execution, start with the default conservative settings, `--processes 5` and `--chunk-size 32`. Increase these values only after confirming that CPU cores, memory, and solver license capacity are sufficient.
 
 > ** Note:** If TFBA is interrupted after partial results have been written, do not delete the partially generated output file. Rerun the same command using the same `--output` path. The script automatically detects the existing output file and continues from the next unfinished reaction index.
 
