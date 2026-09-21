@@ -78,6 +78,7 @@ Example usage:
   python run_tfba.py model.mat dGr_predictions.csv --compartments compartments.json
   python run_tfba.py model.xml dGr_predictions.csv --output results.csv --processes 10
   python run_tfba.py model.xml dGr_predictions.csv --solver copt
+  python run_tfba.py model.xml dGr_predictions.csv --work-limit 800
         '''
     )
 
@@ -102,6 +103,12 @@ Example usage:
     parser.add_argument('--v-ei', type=int, default=None,
                         help='End reaction index (0-based, inclusive) for TFBA inference. Use to process a subset of reactions. If not provided, runs to the last reaction (default: None)')
 
+    parser.add_argument('--work-limit', type=float, default=None,
+                        help='Gurobi only: per-solve WorkLimit in deterministic work units (default: 400). '
+                             'Reactions whose solves exceed the limit are NOT solved and NOT retried: they are '
+                             'recorded in <output>_failed.csv. If you need those results, re-run with a higher '
+                             '--work-limit: more reactions get solved, but runtime increases; already solved '
+                             'reactions are skipped automatically.')
     parser.add_argument('--run-fba', action='store_true', default=False,
                         help='Also run FBA directionality inference and save to <gem_basename>_Directionality_FBA.csv')
 
@@ -293,6 +300,16 @@ tgem = tGEM(
     concentration_ub=None,
     biomass_synthesis=biomass_synthesis
 )
+
+if solver == 'gurobi':
+    if args.work_limit is not None:
+        tgem.work_limit = args.work_limit
+        print(f"WorkLimit set from CLI: {args.work_limit:.0f}")
+elif args.work_limit is not None:
+    print('NOTE: --work-limit is Gurobi-only and is ignored with --solver copt.')
+
+print('Reactions not solved within the effort limit are recorded in *_failed.csv and are not retried; '
+      're-run with a higher --work-limit to solve them at the cost of longer runtime.')
 
 
 # -----------------------------

@@ -29,15 +29,35 @@ ln10 = math.log(10)
 _REL_GAP = 1e-3
 _THREADS_PER_WORKER = 1
 
+# Deterministic per-solve effort cap, in work units (machine-independent,
+# ~1 second of single-thread work on a reference machine). WorkLimit is
+# preferred over NodeLimit/TimeLimit: it also counts root LP, presolve, cuts
+# and heuristics, so it still terminates solves stuck at the root node where
+# NodeLimit is blind, and unlike TimeLimit it does not make the result depend
+# on machine speed. A solve hitting the limit marks its reaction as failed:
+# it is recorded in <results>_failed.csv instead of the main results file,
+# and the user can re-run with a higher limit (via tGEM.work_limit) to
+# solve more of them at the cost of longer runtime.
+_WORK_LIMIT = 400.0
 
-def TFBA(model:cobra.core.model.Model, 
-         thermo_constrain:np.ndarray = None, 
-         concentration_ub:float = None, 
-         biomass_synthesis:float = None, 
-         abs_v_sum:float = None, 
-         env=None) -> dict:
+# statuses meaning "solver stopped early on an effort limit": such solves have
+# no usable answer, so the reaction is routed to _failed.csv (not recorded as
+# NaN) and is retried automatically if a later run uses a higher limit
+_LIMIT_STATUSES = (GRB.WORK_LIMIT, GRB.TIME_LIMIT, GRB.NODE_LIMIT,
+                   GRB.SOLUTION_LIMIT, GRB.ITERATION_LIMIT, GRB.INTERRUPTED)
+_LIMIT_HIT = object()
+
+
+def TFBA(model:cobra.core.model.Model,
+         thermo_constrain:np.ndarray = None,
+         concentration_ub:float = None,
+         biomass_synthesis:float = None,
+         abs_v_sum:float = None,
+         env=None,
+         work_limit:float = None) -> dict:
     m = gp.Model(name=f'{model.id} TFBA model', env=env)
     output = {'model':m}
+    output['work_limit'] = _WORK_LIMIT if work_limit is None else float(work_limit)
     m.setParam('OutputFlag', 0)
     m.setParam('MIPFocus', 0)
     m.setParam('IntFeasTol', 1e-9)
@@ -154,6 +174,7 @@ def infer_v_range(model_dict, v_num, sense='min', OutputFlag=0):
     model = model_dict['model']
     model.setParam('OutputFlag', OutputFlag)
     model.setParam('MIPGap', _REL_GAP)
+    model.setParam('WorkLimit', model_dict['work_limit'])
     rxn_v = model_dict['v'][v_num]
 
     model.setObjective(rxn_v, {'min':GRB.MINIMIZE, 'max':GRB.MAXIMIZE}[sense])
@@ -163,6 +184,8 @@ def infer_v_range(model_dict, v_num, sense='min', OutputFlag=0):
         return r
     if model.Status in (GRB.INF_OR_UNBD, GRB.UNBOUNDED):
         return -np.inf if sense == 'min' else np.inf
+    if model.Status in _LIMIT_STATUSES:
+        return _LIMIT_HIT
     return np.nan
 
 
@@ -171,6 +194,7 @@ def infer_dGr_range(model_dict, v_num, sense='min', OutputFlag=0):
     model = model_dict['model']
     model.setParam('OutputFlag', OutputFlag)
     model.setParam('MIPGap', _REL_GAP)
+    model.setParam('WorkLimit', model_dict['work_limit'])
     dgr = model_dict['real_dGr'][v_num]
 
     model.setObjective(dgr, {'min':GRB.MINIMIZE, 'max':GRB.MAXIMIZE}[sense])
@@ -180,6 +204,8 @@ def infer_dGr_range(model_dict, v_num, sense='min', OutputFlag=0):
     if model.Status != GRB.OPTIMAL:
         if not model_dict['anchored'][v_num]:
             return -np.inf if sense == 'min' else np.inf
+        if model.Status in _LIMIT_STATUSES:
+            return _LIMIT_HIT
         return np.nan
     r = 0.0 if model.ObjVal==-0.0 else np.round(model.ObjVal, 6)
     r = np.inf if r>=1e5 else r
@@ -542,6 +568,7 @@ class tGEM(object):
         self.dGr = dGr
         self.concentration_ub = concentration_ub
         self.biomass_synthesis = biomass_synthesis
+        self.work_limit = None   # None -> module default _WORK_LIMIT
 
         self.MIPFocus = 0
         self.FBA_res_file_path = None #
@@ -551,10 +578,11 @@ class tGEM(object):
         ''' mutiprocessing the main fun '''
         thermo_constrain = self.dGr if thermo_constrain else None
         t0 = time.perf_counter()
-        m = TFBA(self.GEM, thermo_constrain=thermo_constrain, concentration_ub=self.concentration_ub, 
-                    biomass_synthesis=None, env=None)
+        m = TFBA(self.GEM, thermo_constrain=thermo_constrain, concentration_ub=self.concentration_ub,
+                    biomass_synthesis=None, env=None, work_limit=self.work_limit)
         v = m['biomass_v']
         m['model'].setParam('MIPFocus', self.MIPFocus)
+        m['model'].setParam('WorkLimit', m['work_limit'])
         m['model'].setObjective(v, GRB.MAXIMIZE)
         m['model'].optimize()
 
@@ -575,13 +603,20 @@ class tGEM(object):
         env.start()
         try:
             m = TFBA(self.GEM, thermo_constrain=None, concentration_ub=self.concentration_ub,
-                     biomass_synthesis=self.biomass_synthesis, env=env)
+                     biomass_synthesis=self.biomass_synthesis, env=env,
+                     work_limit=self.work_limit)
             m['model'].setParam('MIPFocus', self.MIPFocus)
             for vi in vi_list:
                 try:
                     max_v = infer_v_range(m, vi, 'max')
                     min_v = infer_v_range(m, vi, 'min')
-                    results.append((vi, min_v, max_v))
+                    if max_v is _LIMIT_HIT or min_v is _LIMIT_HIT:
+                        print(f'rxn {vi} FBA: solve limit exceeded, recorded as failed', flush=True)
+                    elif min_v > max_v:   # NaN passes: only a definite ordering violation fails
+                        print(f'rxn {vi} FBA: inconsistent range (lv={min_v}, uv={max_v}), '
+                              f'recorded as failed', flush=True)
+                    else:
+                        results.append((vi, min_v, max_v))
                 except Exception as e:
                     print(f'rxn {vi} FBA failed: {e}', flush=True)
                 finally:
@@ -626,10 +661,9 @@ class tGEM(object):
                 pump.join()
                 pbar.close()
 
-        failed = self._retry(_run_fba_chunk, failed, process)
         if failed:
             failed_path = self.FBA_res_file_path.replace('.csv', '_failed.csv')
-            print(f'WARNING: {len(failed)} reaction(s) still failed after 3 retries, saved to {failed_path}')
+            print(f'WARNING: {len(failed)} reaction(s) unsolved (solver error or effort limit exceeded), saved to {failed_path}; re-run with a higher work limit to retry them')
             pd.DataFrame({'rxn num': failed}).set_index('rxn num').to_csv(failed_path)
 
         print('All done')
@@ -652,7 +686,8 @@ class tGEM(object):
         env.start()
         try:
             m = TFBA(self.GEM, thermo_constrain=self.dGr, concentration_ub=self.concentration_ub,
-                     biomass_synthesis=self.biomass_synthesis, env=env)
+                     biomass_synthesis=self.biomass_synthesis, env=env,
+                     work_limit=self.work_limit)
             m['model'].setParam('MIPFocus', self.MIPFocus)
             for vi in vi_list:
                 try:
@@ -660,7 +695,13 @@ class tGEM(object):
                     min_dGr = infer_dGr_range(m, vi, 'min')
                     min_v = infer_v_range(m, vi, 'min')
                     max_dGr = infer_dGr_range(m, vi, 'max')
-                    results.append((vi, min_v, max_v, min_dGr, max_dGr))
+                    if any(x is _LIMIT_HIT for x in (max_v, min_dGr, min_v, max_dGr)):
+                        print(f'rxn {vi} TFBA: solve limit exceeded, recorded as failed', flush=True)
+                    elif min_v > max_v or min_dGr > max_dGr:   # NaN passes: only definite ordering violations fail
+                        print(f'rxn {vi} TFBA: inconsistent ranges (lv={min_v}, uv={max_v}, '
+                              f'ldGr={min_dGr}, udGr={max_dGr}), recorded as failed', flush=True)
+                    else:
+                        results.append((vi, min_v, max_v, min_dGr, max_dGr))
                 except Exception as e:
                     print(f'rxn {vi} TFBA failed: {e}', flush=True)
                 finally:
@@ -710,35 +751,13 @@ class tGEM(object):
                 pump.join()
                 pbar.close()
 
-        failed = self._retry(_run_tfba_chunk, failed, process)
         if failed:
             failed_path = self.TFBA_res_file_path.replace('.csv', '_failed.csv')
-            print(f'WARNING: {len(failed)} reaction(s) still failed after 3 retries, saved to {failed_path}')
+            print(f'WARNING: {len(failed)} reaction(s) unsolved (solver error or effort limit exceeded), saved to {failed_path}; re-run with a higher work limit to retry them')
             pd.DataFrame({'rxn num': failed}).set_index('rxn num').to_csv(failed_path)
 
         print('All done')
         return None
-
-    def _retry(self, chunk_fn, failed, process, max_retry=3):
-        ''' retry failed reactions with tiny chunks (4 per chunk) '''
-        for retry_num in range(1, max_retry + 1):
-            if not failed:
-                break
-            print(f'Retrying {len(failed)} failed reaction(s), attempt {retry_num} ...')
-            chunks = [failed[k:k + 4] for k in range(0, len(failed), 4)]
-            still_failed = []
-            with _MP_CTX.Pool(min(process, len(chunks)), initializer=_init_worker,
-                              initargs=(self,)) as pool:
-                for vi_list, res in pool.imap_unordered(chunk_fn, chunks):
-                    done_ids = {r[0] for r in res}
-                    still_failed.extend(vi for vi in vi_list if vi not in done_ids)
-                    res_path = self.TFBA_res_file_path if 'tfba' in chunk_fn.__name__ \
-                        else self.FBA_res_file_path
-                    columns = ['rxn num', 'lv', 'uv', 'ldGr', 'udGr'] \
-                        if chunk_fn.__name__ == '_run_tfba_chunk' else ['rxn num', 'lv', 'uv']
-                    _save_rows(res_path, res, columns)
-            failed = still_failed
-        return failed
 
     def concurrent_optimize(self, thermo_constrain, concentration_ub, biomass_synthesis,
                             process=16, batch_size=200, obj_list=None):

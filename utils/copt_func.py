@@ -63,6 +63,22 @@ _REL_GAP = 1e-3
 _FEAS_TOL = 1e-9
 _THREADS_PER_WORKER = 1
 
+# Deterministic per-solve effort cap. COPT has no work-unit limit (the Gurobi
+# WorkLimit equivalent), so NodeLimit is the only machine-independent knob;
+# TimeLimit is a wall-clock backstop for the one case NodeLimit cannot see
+# (solves stuck at the root node, where the node count never grows). Only if
+# the TimeLimit backstop triggers is the result machine-dependent. Hitting
+# either limit falls through to the non-OPTIMAL branch of infer_*_range
+# ('undetermined' NaN, or +/-inf for unanchored dGr).
+_NODE_LIMIT = 10000
+_TIME_LIMIT = 300.0
+
+# statuses meaning "solver stopped early on an effort limit": such solves have
+# no usable answer, so the reaction is routed to _failed.csv (not recorded as
+# NaN) and is retried automatically if a later run uses a higher limit
+_LIMIT_STATUSES = (COPT.NODELIMIT, COPT.TIMEOUT, COPT.ITERLIMIT)
+_LIMIT_HIT = object()
+
 
 def _quiet(fn, *args, **kwargs):
     """Call fn with fd-1 redirected to /dev/null to suppress COPT console log."""
@@ -85,6 +101,8 @@ def _new_model(env, name='TFBA', gap=_REL_GAP, threads=_THREADS_PER_WORKER):
     _quiet(m.setParam, 'IntTol', _FEAS_TOL)
     if threads is not None and threads != 0:
         _quiet(m.setParam, 'Threads', threads)
+    _quiet(m.setParam, 'NodeLimit', _NODE_LIMIT)
+    _quiet(m.setParam, 'TimeLimit', _TIME_LIMIT)
     return m
 
 
@@ -238,6 +256,8 @@ def infer_v_range(model_dict, v_num, sense='min'):
         return 0.0 if val == -0.0 or abs(val) < 1e-12 else np.round(val, 6)
     if status == COPT.UNBOUNDED:
         return -np.inf if sense == 'min' else np.inf
+    if status in _LIMIT_STATUSES:
+        return _LIMIT_HIT
     return np.nan
 
 
@@ -254,6 +274,8 @@ def infer_dGr_range(model_dict, v_num, sense='min'):
     if status != COPT.OPTIMAL:
         if not model_dict['anchored'][v_num]:
             return -np.inf if sense == 'min' else np.inf
+        if status in _LIMIT_STATUSES:
+            return _LIMIT_HIT
         return np.nan
     val = m.objval
     r = 0.0 if val == -0.0 or abs(val) < 1e-12 else np.round(val, 6)
@@ -384,7 +406,13 @@ class tGEM(object):
                 try:
                     max_v = infer_v_range(m, vi, 'max')
                     min_v = infer_v_range(m, vi, 'min')
-                    results.append((vi, min_v, max_v))
+                    if max_v is _LIMIT_HIT or min_v is _LIMIT_HIT:
+                        print(f'rxn {vi} FBA: solve limit exceeded, recorded as failed', flush=True)
+                    elif min_v > max_v:   # NaN passes: only a definite ordering violation fails
+                        print(f'rxn {vi} FBA: inconsistent range (lv={min_v}, uv={max_v}), '
+                              f'recorded as failed', flush=True)
+                    else:
+                        results.append((vi, min_v, max_v))
                 except Exception as e:
                     print(f'rxn {vi} FBA failed: {e}', flush=True)
                 finally:
@@ -407,7 +435,13 @@ class tGEM(object):
                     min_dGr = infer_dGr_range(m, vi, 'min')
                     min_v = infer_v_range(m, vi, 'min')
                     max_dGr = infer_dGr_range(m, vi, 'max')
-                    results.append((vi, min_v, max_v, min_dGr, max_dGr))
+                    if any(x is _LIMIT_HIT for x in (max_v, min_dGr, min_v, max_dGr)):
+                        print(f'rxn {vi} TFBA: solve limit exceeded, recorded as failed', flush=True)
+                    elif min_v > max_v or min_dGr > max_dGr:   # NaN passes: only definite ordering violations fail
+                        print(f'rxn {vi} TFBA: inconsistent ranges (lv={min_v}, uv={max_v}, '
+                              f'ldGr={min_dGr}, udGr={max_dGr}), recorded as failed', flush=True)
+                    else:
+                        results.append((vi, min_v, max_v, min_dGr, max_dGr))
                 except Exception as e:
                     print(f'rxn {vi} TFBA failed: {e}', flush=True)
                 finally:
@@ -456,10 +490,9 @@ class tGEM(object):
                 pump.join()
                 pbar.close()
 
-        failed = self._retry(_run_fba_chunk, failed, process)
         if failed:
             failed_path = self.FBA_res_file_path.replace('.csv', '_failed.csv')
-            print(f'WARNING: {len(failed)} reaction(s) still failed after 3 retries, saved to {failed_path}')
+            print(f'WARNING: {len(failed)} reaction(s) unsolved (solver error or effort limit exceeded), saved to {failed_path}; re-run with a higher limit to retry them')
             pd.DataFrame({'rxn num': failed}).set_index('rxn num').to_csv(failed_path)
 
         print('All done')
@@ -505,32 +538,10 @@ class tGEM(object):
                 pump.join()
                 pbar.close()
 
-        failed = self._retry(_run_tfba_chunk, failed, process)
         if failed:
             failed_path = self.TFBA_res_file_path.replace('.csv', '_failed.csv')
-            print(f'WARNING: {len(failed)} reaction(s) still failed after 3 retries, saved to {failed_path}')
+            print(f'WARNING: {len(failed)} reaction(s) unsolved (solver error or effort limit exceeded), saved to {failed_path}; re-run with a higher limit to retry them')
             pd.DataFrame({'rxn num': failed}).set_index('rxn num').to_csv(failed_path)
 
         print('All done')
         return None
-
-    def _retry(self, chunk_fn, failed, process, max_retry=3):
-        ''' retry failed reactions with tiny chunks (4 per chunk) '''
-        for retry_num in range(1, max_retry + 1):
-            if not failed:
-                break
-            print(f'Retrying {len(failed)} failed reaction(s), attempt {retry_num} ...')
-            chunks = [failed[k:k + 4] for k in range(0, len(failed), 4)]
-            still_failed = []
-            with _MP_CTX.Pool(min(process, len(chunks)), initializer=_init_worker,
-                              initargs=(self,)) as pool:
-                for vi_list, res in pool.imap_unordered(chunk_fn, chunks):
-                    done_ids = {r[0] for r in res}
-                    still_failed.extend(vi for vi in vi_list if vi not in done_ids)
-                    res_path = self.TFBA_res_file_path if 'tfba' in chunk_fn.__name__ \
-                        else self.FBA_res_file_path
-                    columns = ['rxn num', 'lv', 'uv', 'ldGr', 'udGr'] \
-                        if chunk_fn.__name__ == '_run_tfba_chunk' else ['rxn num', 'lv', 'uv']
-                    _save_rows(res_path, res, columns)
-            failed = still_failed
-        return failed
