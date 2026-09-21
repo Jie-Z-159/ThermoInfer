@@ -109,6 +109,14 @@ Example usage:
                              'recorded in <output>_failed.csv. If you need those results, re-run with a higher '
                              '--work-limit: more reactions get solved, but runtime increases; already solved '
                              'reactions are skipped automatically.')
+    parser.add_argument('--node-limit', type=int, default=None,
+                        help='COPT only: per-solve NodeLimit (default: 10000). '
+                             'Reactions whose solves exceed the limit are recorded in <output>_failed.csv. '
+                             'Re-run with a higher --node-limit to retry failed reactions.')
+    parser.add_argument('--time-limit', type=float, default=None,
+                        help='COPT only: per-solve TimeLimit in seconds (default: 300). '
+                             'Reactions whose solves exceed the limit are recorded in <output>_failed.csv. '
+                             'Re-run with a higher --time-limit to retry failed reactions.')
     parser.add_argument('--run-fba', action='store_true', default=False,
                         help='Also run FBA directionality inference and save to <gem_basename>_Directionality_FBA.csv')
 
@@ -305,11 +313,20 @@ if solver == 'gurobi':
     if args.work_limit is not None:
         tgem.work_limit = args.work_limit
         print(f"WorkLimit set from CLI: {args.work_limit:.0f}")
-elif args.work_limit is not None:
-    print('NOTE: --work-limit is Gurobi-only and is ignored with --solver copt.')
+    if args.node_limit is not None or args.time_limit is not None:
+        print('NOTE: --node-limit and --time-limit are COPT-only and are ignored with --solver gurobi.')
+elif solver == 'copt':
+    if args.node_limit is not None:
+        tgem.node_limit = args.node_limit
+        print(f"NodeLimit set from CLI: {args.node_limit}")
+    if args.time_limit is not None:
+        tgem.time_limit = args.time_limit
+        print(f"TimeLimit set from CLI: {args.time_limit:.1f}s")
+    if args.work_limit is not None:
+        print('NOTE: --work-limit is Gurobi-only and is ignored with --solver copt.')
 
 print('Reactions not solved within the effort limit are recorded in *_failed.csv and are not retried; '
-      're-run with a higher --work-limit to solve them at the cost of longer runtime.')
+      're-run with a higher limit to solve them at the cost of longer runtime.')
 
 
 # -----------------------------
