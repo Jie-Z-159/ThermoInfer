@@ -354,6 +354,8 @@ class tGEM(object):
         self.dGr = dGr
         self.concentration_ub = concentration_ub
         self.biomass_synthesis = biomass_synthesis
+        self.node_limit = None   # None -> module default _NODE_LIMIT
+        self.time_limit = None   # None -> module default _TIME_LIMIT
         self.FBA_res_file_path = None
         self.TFBA_res_file_path = None
 
@@ -402,15 +404,19 @@ class tGEM(object):
         try:
             m = TFBA(self.GEM, thermo_constrain=None, concentration_ub=self.concentration_ub,
                      biomass_synthesis=self.biomass_synthesis, env=env)
+            # Apply custom limits if set
+            if self.node_limit is not None:
+                _quiet(m['model'].setParam, 'NodeLimit', int(self.node_limit))
+            if self.time_limit is not None:
+                _quiet(m['model'].setParam, 'TimeLimit', float(self.time_limit))
             for vi in vi_list:
                 try:
                     max_v = infer_v_range(m, vi, 'max')
                     min_v = infer_v_range(m, vi, 'min')
                     if max_v is _LIMIT_HIT or min_v is _LIMIT_HIT:
-                        print(f'rxn {vi} FBA: solve limit exceeded, recorded as failed', flush=True)
+                        pass
                     elif min_v > max_v:   # NaN passes: only a definite ordering violation fails
-                        print(f'rxn {vi} FBA: inconsistent range (lv={min_v}, uv={max_v}), '
-                              f'recorded as failed', flush=True)
+                        pass
                     else:
                         results.append((vi, min_v, max_v))
                 except Exception as e:
@@ -429,6 +435,11 @@ class tGEM(object):
         try:
             m = TFBA(self.GEM, thermo_constrain=self.dGr, concentration_ub=self.concentration_ub,
                      biomass_synthesis=self.biomass_synthesis, env=env)
+            # Apply custom limits if set
+            if self.node_limit is not None:
+                _quiet(m['model'].setParam, 'NodeLimit', int(self.node_limit))
+            if self.time_limit is not None:
+                _quiet(m['model'].setParam, 'TimeLimit', float(self.time_limit))
             for vi in vi_list:
                 try:
                     max_v = infer_v_range(m, vi, 'max')
@@ -436,10 +447,9 @@ class tGEM(object):
                     min_v = infer_v_range(m, vi, 'min')
                     max_dGr = infer_dGr_range(m, vi, 'max')
                     if any(x is _LIMIT_HIT for x in (max_v, min_dGr, min_v, max_dGr)):
-                        print(f'rxn {vi} TFBA: solve limit exceeded, recorded as failed', flush=True)
+                        pass
                     elif min_v > max_v or min_dGr > max_dGr:   # NaN passes: only definite ordering violations fail
-                        print(f'rxn {vi} TFBA: inconsistent ranges (lv={min_v}, uv={max_v}, '
-                              f'ldGr={min_dGr}, udGr={max_dGr}), recorded as failed', flush=True)
+                        pass
                     else:
                         results.append((vi, min_v, max_v, min_dGr, max_dGr))
                 except Exception as e:

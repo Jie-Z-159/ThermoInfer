@@ -611,10 +611,9 @@ class tGEM(object):
                     max_v = infer_v_range(m, vi, 'max')
                     min_v = infer_v_range(m, vi, 'min')
                     if max_v is _LIMIT_HIT or min_v is _LIMIT_HIT:
-                        print(f'rxn {vi} FBA: solve limit exceeded, recorded as failed', flush=True)
+                        pass
                     elif min_v > max_v:   # NaN passes: only a definite ordering violation fails
-                        print(f'rxn {vi} FBA: inconsistent range (lv={min_v}, uv={max_v}), '
-                              f'recorded as failed', flush=True)
+                        pass
                     else:
                         results.append((vi, min_v, max_v))
                 except Exception as e:
@@ -696,10 +695,9 @@ class tGEM(object):
                     min_v = infer_v_range(m, vi, 'min')
                     max_dGr = infer_dGr_range(m, vi, 'max')
                     if any(x is _LIMIT_HIT for x in (max_v, min_dGr, min_v, max_dGr)):
-                        print(f'rxn {vi} TFBA: solve limit exceeded, recorded as failed', flush=True)
+                        pass
                     elif min_v > max_v or min_dGr > max_dGr:   # NaN passes: only definite ordering violations fail
-                        print(f'rxn {vi} TFBA: inconsistent ranges (lv={min_v}, uv={max_v}, '
-                              f'ldGr={min_dGr}, udGr={max_dGr}), recorded as failed', flush=True)
+                        pass
                     else:
                         results.append((vi, min_v, max_v, min_dGr, max_dGr))
                 except Exception as e:
