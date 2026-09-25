@@ -33,6 +33,8 @@ Integrating reaction thermodynamics is essential for refining constraint-based m
 
 Users should run this protocol in a Linux or WSL2/Ubuntu environment with **Conda** installed. A valid **Gurobi license** is required (a **COPT** license may be used instead as the alternative solver, see below). GPU acceleration is optional.
 
+The protocol was developed and tested with **Python 3.13.7** and the package versions pinned in the `environment.yml` file bundled with dGbyG (e.g., `numpy=2.3.2`, `pandas=2.3.2`, `cobra=0.29.1`, `rdkit=2025.03.6`, `torch=2.8.0`). Solver versions used for testing: **Gurobi 13.0.2** and **COPT (coptpy) 8.0.6**.
+
 ---
 
 ## Environment Setup
@@ -46,7 +48,7 @@ git lfs version
 
 If Git LFS is not available:
 ```bash
-conda install -c conda-forge git-lfs
+conda install -c conda-forge git-lfs=3.3.0
 git lfs install
 ```
 
@@ -80,7 +82,7 @@ conda activate dgbyg-thermoinfer
 Install JupyterLab, dGbyG, and ThermoInfer:
 
 ```bash
-conda install -c conda-forge jupyterlab -y
+conda install -c conda-forge jupyterlab=4.6.1 -y
 
 cd ~/dgbyg_thermoinfer_protocol/dGbyG
 python -m pip install -e .
@@ -92,7 +94,7 @@ python -m pip install -e .
 ### 4. Install Gurobi
 
 ```bash
-conda install -c gurobi gurobi -y
+conda install -c gurobi gurobi=13.0.2 -y
 ```
 
 > **CRITICAL:** Prepare a valid Gurobi license before running ThermoInfer. Academic users can obtain a free license from the [Gurobi User Portal](https://www.gurobi.com/academia/academic-program-and-licenses/).
@@ -100,7 +102,7 @@ conda install -c gurobi gurobi -y
 > **Note (alternative solver):** If Gurobi is not available, ThermoInfer also supports the [COPT](https://www.shanshu.ai/copt) (Cardinal Optimizer) as an alternative MILP solver. COPT likewise requires a license; free academic licenses are available from the COPT official website. To use COPT, install its Python package separately (it is not a hard dependency of ThermoInfer):
 >
 > ```bash
-> pip install coptpy
+> pip install coptpy==8.0.6
 > ```
 >
 > Then run the protocol with `--solver copt` (see Stage 3 below).

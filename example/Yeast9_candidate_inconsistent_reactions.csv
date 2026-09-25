@@ -8,4 +8,4 @@ Reaction number,Reaction ID,Original equation,Compartment,dGr_prime (kJ/mol),SD 
 2420,r_3056,H2O + 1-acylglycerophosphoethanolamine (18:0) => H+ + stearate + sn-glycero-3-phosphoethanolamine,ce,656.4972381591797,24.31483984361047,sbo: SBO:0000176; ec-code: 3.1.1.5; kegg.pathway: sce00564; pubmed: 22345606
 2421,r_3057,H2O + 1-acylglycerophosphoethanolamine (18:1) => H+ + oleate + sn-glycero-3-phosphoethanolamine,ce,655.3761138916016,24.8874503151228,sbo: SBO:0000176; ec-code: 3.1.1.5; kegg.pathway: sce00564; pubmed: 22345606
 2466,r_3102,"H2O + phosphatidylglycerol (1-16:0, 2-18:1) => 2.0 H+ + glycerol 3-phosphate + diglyceride (1-16:0, 2-18:1)",mm,1061.7747342427472,63.20422537325267,sbo: SBO:0000176; ec-code: 3.1.4.-; kegg.pathway: sce00564; pubmed: 22345606
-4089,r_4772,ATP + dCDP => ADP + dCTP,m,-0.0004393813687784,10.14098192879472,sbo: SBO:0000176; ec-code: 2.7.4.6; kegg.pathway: Pyrimidine metabolism; kegg.reaction: R00139; metanetx.reaction: MNXR106405
+3715,r_4386,H2O + Ala-Asp => L-aspartate + L-alanine,v,7.01005010780537,22.24420593213797,sbo: SBO:0000176; ec-code: 3.4.13.18; metanetx.reaction: MNXR123344

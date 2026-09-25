@@ -36,9 +36,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-username/ThermoInfer"
-Repository = "https://github.com/your-username/ThermoInfer"
-Documentation = "https://github.com/your-username/ThermoInfer"
+Homepage = "https://github.com/Jie-Z-159/ThermoInfer"
+Repository = "https://github.com/Jie-Z-159/ThermoInfer"
+Documentation = "https://github.com/Jie-Z-159/ThermoInfer"
 
 [tool.setuptools]
 package-dir = {"ThermoInfer" = "."}

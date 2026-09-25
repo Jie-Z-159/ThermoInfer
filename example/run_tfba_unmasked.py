@@ -1,0 +1,369 @@
+import os
+
+# Create gurobi.env to suppress Gurobi output BEFORE importing any Gurobi-related modules
+with open(os.path.join(os.getcwd(), "gurobi.env"), "w", encoding="utf-8") as f:
+    f.write("OutputFlag 0\n")
+
+import sys
+import time
+import json
+import argparse
+import contextlib
+import cobra
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+from ThermoInfer.utils.constants import *
+
+
+@contextlib.contextmanager
+def suppress_stdout_stderr():
+    with open(os.devnull, 'w') as devnull:
+        old_stdout = os.dup(1)
+        old_stderr = os.dup(2)
+        os.dup2(devnull.fileno(), 1)
+        os.dup2(devnull.fileno(), 2)
+        try:
+            yield
+        finally:
+            os.dup2(old_stdout, 1)
+            os.dup2(old_stderr, 2)
+            os.close(old_stdout)
+            os.close(old_stderr)
+
+
+def get_default_compartment_conditions(gem):
+    return {
+        compartment: {"pH": default_pH, "e_potential": 0.0, "T": default_T, "I": default_I, "pMg": default_pMg}
+        for compartment in gem.compartments
+    }
+
+
+def load_compartment_conditions(json_path):
+    with open(json_path, 'r') as f:
+        return json.load(f)
+
+
+def is_gurobi_license_error(error):
+    error_msg = str(error).lower()
+
+    license_keywords = [
+        "license",
+        "size-limited",
+        "hostid mismatch",
+        "no valid license",
+        "no gurobi license",
+        "unable to open gurobi license",
+        "license expired",
+        "grb_license_file",
+        "gurobi error 10009",
+        "gurobi error 10010",
+    ]
+
+    return any(keyword in error_msg for keyword in license_keywords)
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description='Run TFBA directionality inference on a genome-scale metabolic model. '
+                    'This variant does NOT mask multi-compartment (transport) reactions: '
+                    'they keep their dGbyG predictions and receive thermodynamic constraints.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Supported GEM file formats:
+  .xml / .sbml    SBML format, read with cobra.io.read_sbml_model()
+  .mat            MATLAB format, read with cobra.io.load_matlab_model()
+
+Example usage:
+  python run_tfba_unmasked.py model.xml dGr_predictions.csv
+  python run_tfba_unmasked.py model.mat dGr_predictions.csv --compartments compartments.json
+  python run_tfba_unmasked.py model.xml dGr_predictions.csv --output results.csv --processes 10
+  python run_tfba_unmasked.py model.xml dGr_predictions.csv --solver copt
+  python run_tfba_unmasked.py model.xml dGr_predictions.csv --work-limit 800
+        '''
+    )
+
+    parser.add_argument('--solver', choices=['gurobi', 'copt'], default='gurobi',
+                        help='MILP solver backend: gurobi (default) or copt')
+    parser.add_argument('gem_path', type=str,
+                        help='Path to the GEM file (.xml, .sbml, or .mat)')
+    parser.add_argument('dgr_path', type=str,
+                        help='Path to the dGbyG reaction-level predictions CSV file')
+    parser.add_argument('--compartments', type=str, default=None,
+                        help='Path to compartment conditions JSON file. If not provided, all compartments use default values (pH=7.0, e_potential=0.0, T=298.15, I=0.25, pMg=14.0)')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Path to output TFBA directionality CSV file (default: <gem_basename>_Directionality_TFBA.csv)')
+    parser.add_argument('--chunk-size', type=int, default=None,
+                        help='Max reactions per worker task; one solver model is built and reused per task, results saved after each task (default: 32)')
+    parser.add_argument('--processes', type=int, default=5,
+                        help='Number of worker processes for parallel processing (default: 5)')
+    parser.add_argument('--biomass-fraction', type=float, default=0.1,
+                        help='Fraction of maximum biomass flux to use as minimum requirement (default: 0.1)')
+    parser.add_argument('--v-si', type=int, default=0,
+                        help='Start reaction index (0-based) for TFBA inference. Use to resume an interrupted run or process a subset of reactions (default: 0)')
+    parser.add_argument('--v-ei', type=int, default=None,
+                        help='End reaction index (0-based, inclusive) for TFBA inference. Use to process a subset of reactions. If not provided, runs to the last reaction (default: None)')
+
+    parser.add_argument('--work-limit', type=float, default=None,
+                        help='Gurobi only: per-solve WorkLimit in deterministic work units (default: 400). '
+                             'Reactions whose solves exceed the limit are NOT solved and NOT retried: they are '
+                             'recorded in <output>_failed.csv. If you need those results, re-run with a higher '
+                             '--work-limit: more reactions get solved, but runtime increases; already solved '
+                             'reactions are skipped automatically.')
+    parser.add_argument('--node-limit', type=int, default=None,
+                        help='COPT only: per-solve NodeLimit (default: 10000). '
+                             'Reactions whose solves exceed the limit are recorded in <output>_failed.csv. '
+                             'Re-run with a higher --node-limit to retry failed reactions.')
+    parser.add_argument('--time-limit', type=float, default=None,
+                        help='COPT only: per-solve TimeLimit in seconds (default: 300). '
+                             'Reactions whose solves exceed the limit are recorded in <output>_failed.csv. '
+                             'Re-run with a higher --time-limit to retry failed reactions.')
+    parser.add_argument('--run-fba', action='store_true', default=False,
+                        help='Also run FBA directionality inference and save to <gem_basename>_Directionality_FBA.csv')
+
+    return parser.parse_args()
+
+
+args = parse_arguments()
+
+solver = args.solver
+
+if solver == 'copt':
+    from ThermoInfer.utils.copt_func import tGEM, TFBA as COPT_TFBA, _quiet
+    import coptpy as cp
+    from coptpy import COPT
+else:
+    from ThermoInfer.utils.func import tGEM
+
+gem_path = args.gem_path
+dgr_path = args.dgr_path
+
+# Check file existence
+if not os.path.exists(gem_path):
+    print(f"Error: GEM file not found: {gem_path}")
+    sys.exit(1)
+
+if not os.path.exists(dgr_path):
+    print(f"Error: dGr file not found: {dgr_path}")
+    sys.exit(1)
+
+if args.output is None:
+    gem_basename = os.path.splitext(os.path.basename(gem_path))[0]
+    solver_suffix = '_COPT' if solver == 'copt' else ''
+    tfba_output_path = f"./{gem_basename}_Directionality_TFBA_no_mask{solver_suffix}.csv"
+    fba_output_path = f"./{gem_basename}_Directionality_FBA_no_mask{solver_suffix}.csv"
+else:
+    tfba_output_path = args.output
+    fba_output_path = os.path.splitext(args.output)[0].replace('_TFBA', '') + '_FBA.csv'
+
+chunk_size = 32 if args.chunk_size is None else args.chunk_size
+processes = args.processes
+biomass_fraction = args.biomass_fraction
+v_si = args.v_si
+v_ei = args.v_ei
+
+compartment_conditions_source = args.compartments
+
+
+# -----------------------------
+# Load GEM
+# -----------------------------
+
+print(f"Loading GEM from {gem_path}...")
+if gem_path.endswith(".xml") or gem_path.endswith(".sbml"):
+    gem = cobra.io.read_sbml_model(gem_path)
+elif gem_path.endswith(".mat"):
+    gem = cobra.io.load_matlab_model(gem_path)
+else:
+    raise ValueError(f"Unsupported GEM file format: '{gem_path}'. Please provide a .xml, .sbml, or .mat file.")
+
+print(f"Number of reactions: {len(gem.reactions)}")
+print(f"Number of metabolites: {len(gem.metabolites)}")
+
+if compartment_conditions_source is None:
+    print("Using default compartment conditions...")
+    compartment_conditions = get_default_compartment_conditions(gem)
+else:
+    print(f"Loading compartment conditions from {compartment_conditions_source}...")
+    compartment_conditions = load_compartment_conditions(compartment_conditions_source)
+
+
+# -----------------------------
+# Reset reaction bounds
+# -----------------------------
+
+print("Resetting non-boundary reaction bounds...")
+
+for rxn in gem.reactions:
+    if not rxn.boundary:
+        rxn.lower_bound = -1000
+        rxn.upper_bound = 1000
+
+
+# -----------------------------
+# Assign metabolite concentration ranges
+# -----------------------------
+
+print("Assigning metabolite concentration ranges...")
+
+for met in tqdm(gem.metabolites):
+    if met.formula == "H2O":
+        met.lz = H2O_lz
+        met.uz = H2O_uz
+
+    elif met.formula == "H":
+        met.lz = -compartment_conditions[met.compartment]["pH"] - 1.0
+        met.uz = -compartment_conditions[met.compartment]["pH"] + 1.0
+
+    else:
+        met.lz = default_lz
+        met.uz = default_uz
+
+
+# -----------------------------
+# Load the dGbyG output table for predicted dGr values and SDs
+# -----------------------------
+
+print("Loading the dGbyG output table ...")
+
+Rxn_df = pd.read_csv(dgr_path, index_col=0)
+
+# Match dGr data to GEM reactions by reaction ID (not by position)
+print("Matching dGr data to GEM reactions by ID...")
+dGr = np.array([
+    Rxn_df.loc[rxn.id, ["dGr_prime", "SD of dGr_prime"]].to_list()
+    if rxn.id in Rxn_df.index
+    else [np.nan, np.nan]
+    for rxn in gem.reactions
+])
+
+# Validate matching rate
+total_reactions = len(gem.reactions)
+matched_reactions = sum(1 for rxn in gem.reactions if rxn.id in Rxn_df.index)
+match_rate = matched_reactions / total_reactions * 100
+
+print(f"dGr data matching: {matched_reactions}/{total_reactions} reactions ({match_rate:.1f}%)")
+
+# Warn if matching rate is low
+if match_rate < 95:
+    print(f"\nWARNING: Only {match_rate:.1f}% of reaction ids matched between GEM and dGr file.")
+    response = input("    Do you want to continue? (y/n): ")
+    if response.lower() != 'y':
+        print("Aborted by user.")
+        sys.exit(1)
+
+single_compartment_rxn = np.array([
+    len(rxn.compartments) == 1
+    for rxn in gem.reactions
+])
+
+n_multi_with_dgr = int((~single_compartment_rxn & ~np.isnan(dGr[:, 0])).sum())
+print(f"Multi-compartment reactions are NOT masked: {n_multi_with_dgr} transport reaction(s) keep their dGr constraints.")
+
+
+# -----------------------------
+# Build ThermoInfer model
+# -----------------------------
+
+print("Building ThermoInfer model...")
+
+if solver == 'copt':
+    print("Computing maximum biomass flux with COPT ...")
+    try:
+        env = _quiet(cp.Envr)
+        try:
+            fba_model = COPT_TFBA(gem, thermo_constrain=None, concentration_ub=None,
+                                  biomass_synthesis=None, env=env)
+            objective = cp.quicksum(fba_model['biomass_v']) if len(fba_model['biomass_v']) else 0
+            _quiet(fba_model['model'].setObjective, objective, COPT.MAXIMIZE)
+            _quiet(fba_model['model'].solve)
+            if fba_model['model'].status != COPT.OPTIMAL:
+                raise RuntimeError(f"FBA failed, status={fba_model['model'].status}")
+            max_biomass = fba_model['model'].objval
+        finally:
+            env.close()
+    except Exception as e:
+        print(f"\nError during optimization: {e}")
+        sys.exit(1)
+else:
+    try:
+        with suppress_stdout_stderr():
+            max_biomass = gem.slim_optimize()
+    except Exception as e:
+        if is_gurobi_license_error(e):
+            print(f"\nError: No valid Gurobi license available")
+            print(f"   Details: {e}")
+        else:
+            print(f"\nError during optimization: {e}")
+        sys.exit(1)
+
+biomass_synthesis = biomass_fraction * max_biomass
+
+print(f"Maximum biomass flux: {max_biomass}")
+print(f"Minimal biomass requirement: {biomass_synthesis}")
+
+tgem = tGEM(
+    GEM=gem,
+    dGr=dGr,
+    concentration_ub=None,
+    biomass_synthesis=biomass_synthesis
+)
+
+if solver == 'gurobi':
+    if args.work_limit is not None:
+        tgem.work_limit = args.work_limit
+        print(f"WorkLimit set from CLI: {args.work_limit:.0f}")
+    if args.node_limit is not None or args.time_limit is not None:
+        print('NOTE: --node-limit and --time-limit are COPT-only and are ignored with --solver gurobi.')
+elif solver == 'copt':
+    if args.node_limit is not None:
+        tgem.node_limit = args.node_limit
+        print(f"NodeLimit set from CLI: {args.node_limit}")
+    if args.time_limit is not None:
+        tgem.time_limit = args.time_limit
+        print(f"TimeLimit set from CLI: {args.time_limit:.1f}s")
+    if args.work_limit is not None:
+        print('NOTE: --work-limit is Gurobi-only and is ignored with --solver copt.')
+
+print('Reactions not solved within the effort limit are recorded in *_failed.csv and are not retried; '
+      're-run with a higher limit to solve them at the cost of longer runtime.')
+
+
+# -----------------------------
+# Run TFBA directionality inference
+# -----------------------------
+
+print("Running TFBA directionality inference...")
+
+t0 = time.time()
+
+tgem.TFBA_res_file_path = tfba_output_path
+tgem.concurrent_infer_v_and_dGr(
+    v_si=v_si,
+    v_ei=v_ei,
+    chunk_size=chunk_size,
+    process=processes
+)
+
+print(f"TFBA finished in {(time.time() - t0) / 60:.2f} min")
+
+
+# -----------------------------
+# Run FBA directionality inference (optional)
+# -----------------------------
+
+if args.run_fba:
+    print("Running FBA directionality inference...")
+    t0 = time.time()
+
+    tgem.FBA_res_file_path = fba_output_path
+    tgem.concurrent_infer_v(
+        v_si=v_si,
+        v_ei=v_ei,
+        chunk_size=chunk_size,
+        process=processes
+    )
+
+    print(f"FBA finished in {(time.time() - t0) / 60:.2f} min")
+
