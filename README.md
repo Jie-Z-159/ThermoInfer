@@ -1,4 +1,4 @@
-# Protocol for Predicting Gibbs Energies and Inferring Thermodynamic Directions in Genome-Scale Metabolic Models Using dGbyG and ThermoInfer
+# Protocol for thermodynamic analysis of genome-scale metabolic models using dGbyG and ThermoInfer
 ---
 
 [![DOI](https://zenodo.org/badge/latestdoi/1282935895.svg)](https://zenodo.org/badge/latestdoi/1282935895)
