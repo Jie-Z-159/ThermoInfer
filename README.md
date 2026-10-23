@@ -1,8 +1,6 @@
 # Protocol for thermodynamic analysis of genome-scale metabolic models using dGbyG and ThermoInfer
 ---
 
-[![DOI](https://zenodo.org/badge/latestdoi/1282935895.svg)](https://zenodo.org/badge/latestdoi/1282935895)
-
 ## Summary
 
 Integrating reaction thermodynamics is essential for refining constraint-based metabolic models. This repository provides a computational protocol coupling the **dGbyG** package with **ThermoInfer** for thermodynamic feasibility inference. The protocol describes the setup of the computational environment and a worked Yeast-GEM example showing how dGbyG-predicted reaction standerd Gibbs energy values (ΔrG°) can be used in ThermoInfer to evaluate reaction directionality.
