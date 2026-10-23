@@ -70,7 +70,7 @@ git lfs pull
 
 # Clone ThermoInfer
 cd ~/dgbyg_thermoinfer_protocol
-git clone https://gitee.com/f-wc/ThermoInfer.git
+git clone https://github.com/Jie-Z-159/ThermoInfer.git
 ```
 
 ### 3. Create and Activate Conda Environment
